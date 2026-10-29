@@ -1,5 +1,6 @@
 """Independent, read-only HubSpot deal reports posted by Mercedes's Slack bot."""
 import argparse
+from collections import Counter
 import html
 import json
 import os
@@ -69,7 +70,7 @@ def window(now, weekly=False):
 
 def scheduled_slot(now):
     local = now.astimezone(PT)
-    if local.weekday() >= 5 or local.hour not in (8, 12, 18, 21):
+    if local.weekday() >= 5 or local.hour not in (12, 18, 21):
         return None
     return local.replace(minute=0, second=0, microsecond=0)
 
@@ -157,9 +158,18 @@ def render(now, weekly=False):
     start, end = window(now, weekly)
     deals = deals_between(start, end)
     as_of = end.strftime('%b %d, %Y at %I:%M %p %Z')
+    labels = {option['value']: option['label'] for option in hub('/crm/v3/properties/deals/deal_source')['options']} if deals else {}
     if weekly:
-        return [f'*Week To Date*\n*Deals created this week so far: {len(deals)}*\nMonday {start:%b %d} through {as_of}.\nAll stages and pipelines; HubSpot deal creation date.']
-    labels = {option['value']: option['label'] for option in hub('/crm/v3/properties/deals/deal_source')['options']}
+        header = f'*Week To Date*\n*Deals created this week so far: {len(deals)}*\nMonday {start:%b %d} through {as_of}.\nAll stages and pipelines; HubSpot deal creation date.\n*Deal sources this week:*'
+        sources = Counter()
+        for row in deals:
+            raw = row['properties'].get('deal_source')
+            source = labels.get(raw, raw) if raw else 'Source not set'
+            sources[source] += 1
+        lines = [f'• {escape(source)}: {count}' for source, count in sorted(sources.items(), key=lambda item: (-item[1], item[0]))]
+        if not lines:
+            lines = ['No deals created this week so far.']
+        return split_messages(header, lines, '*Week To Date*\n*Deal sources this week — continued*')
     companies = company_names(deals)
     owners = owner_names(deals)
     period = 'am' if end.hour < 12 else 'pm'
@@ -180,12 +190,16 @@ def render(now, weekly=False):
         if end.hour == 18:
             mentions = ' '.join(f'<@{user_id}>' for user_id in ZERO_DEAL_RECIPIENTS)
             lines.append(f'{mentions} — what are your priorities tomorrow to increase our SQL count?')
+    return split_messages(header, lines, f'*{title}*\n*Deals created today — continued*')
+
+
+def split_messages(header, lines, continued_header):
     messages = []
     current = header
     for line in lines:
         if len(current) + len(line) > 3000:
             messages.append(current)
-            current = f'*{title}*\n*Deals created today — continued*'
+            current = continued_header
         current += '\n' + line
     messages.append(current)
     return messages

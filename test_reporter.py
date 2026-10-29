@@ -29,12 +29,42 @@ class ReporterTests(unittest.TestCase):
         self.assertNotIn('priorities tomorrow', text)
 
     def test_pacific_schedule_across_dst_and_weekends(self):
-        for timestamp in ('2026-10-27T15:00:00+00:00', '2026-11-02T16:00:00+00:00',
-                          '2026-10-27T19:00:00+00:00', '2026-10-28T01:00:00+00:00',
+        for timestamp in ('2026-10-27T19:00:00+00:00', '2026-11-02T20:00:00+00:00', '2026-10-28T01:00:00+00:00',
                           '2026-10-28T04:00:00+00:00'):
             self.assertIsNotNone(r.scheduled_slot(datetime.fromisoformat(timestamp)))
-        for timestamp in ('2026-10-31T15:00:00+00:00', '2026-10-27T20:00:00+00:00'):
+        for timestamp in ('2026-10-27T15:00:00+00:00', '2026-11-02T16:00:00+00:00',
+                          '2026-10-31T19:00:00+00:00', '2026-10-27T20:00:00+00:00'):
             self.assertIsNone(r.scheduled_slot(datetime.fromisoformat(timestamp)))
+
+    def test_weekly_sources_count_every_deal_and_use_display_labels(self):
+        rows = [{'id': str(i), 'properties': {'deal_source': source}}
+                for i, source in enumerate(('referral', 'referral', 'outbound', None, 'legacy'))]
+        now = datetime.fromisoformat('2026-10-29T21:00:00-07:00')
+        with patch.object(r, 'deals_between', return_value=rows) as query, patch.object(r, 'hub', return_value={
+            'options': [{'value': 'referral', 'label': 'Partner & Referral'},
+                        {'value': 'outbound', 'label': 'Outbound'}]
+        }):
+            text = '\n'.join(r.render(now, weekly=True))
+        self.assertEqual(query.call_args.args[0].isoformat(), '2026-10-26T00:00:00-07:00')
+        self.assertEqual(query.call_args.args[1], now)
+        self.assertIn('Deals created this week so far: 5', text)
+        self.assertIn('• Partner &amp; Referral: 2', text)
+        self.assertIn('• Outbound: 1', text)
+        self.assertIn('• Source not set: 1', text)
+        self.assertIn('• legacy: 1', text)
+        self.assertNotIn('<@', text)
+
+    def test_weekly_sources_split_without_losing_entries(self):
+        rows = [{'id': str(i), 'properties': {'deal_source': f'Source {i:03} ' + 'x' * 80}}
+                for i in range(100)]
+        with patch.object(r, 'deals_between', return_value=rows), patch.object(r, 'hub', return_value={'options': []}):
+            messages = r.render(datetime.fromisoformat('2026-10-29T21:00:00-07:00'), weekly=True)
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(message) <= 3000 for message in messages))
+        text = '\n'.join(messages)
+        for row in rows:
+            self.assertEqual(text.count('• ' + row['properties']['deal_source'] + ': 1'), 1)
+        self.assertIn('Deal sources this week — continued', messages[1])
 
     def test_monday_and_midnight_boundaries(self):
         now = datetime.fromisoformat('2026-10-27T04:03:38+00:00')
