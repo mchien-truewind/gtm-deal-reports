@@ -11,10 +11,11 @@ Scope: infrastructure script; no Core, Alpha, WWW, or Temporal runtime imports.
   deals, company associations and companies. HubSpot is never mutated.
 
 The hourly UTC trigger checks `America/Los_Angeles` before doing any API work.
-Only Monday–Friday at 08:00, 12:00, 18:00 and 21:00 local time are eligible.
+Only Monday–Friday at 12:00, 18:00 and 21:00 local time are eligible.
 This handles daylight saving changes without editing cron. Railway may start a
 run a few minutes after the hour. At 21:00 the report counts deals created since
-Monday 00:00 Pacific; otherwise it lists deals created since local midnight.
+Monday 00:00 Pacific and includes counts grouped by deal source (including
+missing sources); otherwise it lists deals created since local midnight.
 All active HubSpot deal records, stages and pipelines are included.
 Only the 18:00 Pacific daily report with zero deals mentions Dillon, Xavier,
 Sarah, Nicole, Liz, and Alex and asks: “what are your priorities tomorrow to
@@ -61,8 +62,7 @@ python reporter.py --preview daily --at 2026-10-26T23:59:59-07:00
 
 Source repository: `mchien-truewind/gtm-deal-reports`.
 
-The service was originally deployed by uploading a local folder. The intended
-deployment flow is to connect this repository’s `main` branch to the existing
-Railway service, then deploy automatically when pull requests merge into `main`.
+The service is connected to this repository’s `main` branch and deploys
+automatically when pull requests merge into `main`.
 The repository root contains the Dockerfile and worker; no local machine is
 needed at runtime. Connection status is managed in Railway.
