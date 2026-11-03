@@ -7,6 +7,11 @@ import reporter as r
 
 
 class ReporterTests(unittest.TestCase):
+    def setUp(self):
+        passthrough = patch.object(r, "qualifying_deals", side_effect=lambda rows: rows)
+        passthrough.start()
+        self.addCleanup(passthrough.stop)
+
     def test_only_zero_deal_6pm_pacific_reports_mention_team(self):
         for timestamp, mentions_expected in (
             ('2026-10-27T08:00:00-07:00', False),
@@ -50,7 +55,7 @@ class ReporterTests(unittest.TestCase):
         self.assertIn('Deals created this week so far: 5', text)
         self.assertIn('• Partner &amp; Referral: 2', text)
         self.assertIn('• Outbound: 1', text)
-        self.assertIn('• Source not set: 1', text)
+        self.assertIn('• Source missing — attribution needs review: 1', text)
         self.assertIn('• legacy: 1', text)
         self.assertNotIn('<@', text)
 
@@ -135,6 +140,48 @@ class ReporterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Ambiguous Slack'):
                 r.deliver(db, 'slot', ['one'], datetime.now(r.PT))
             self.assertEqual(call.call_count, 1)
+
+
+class QualificationTests(unittest.TestCase):
+    def qualify(self, emails, properties=None):
+        rows = [{'id': 'deal', 'properties': properties or {}}]
+        responses = [
+            {'status': 'COMPLETE', 'results': [{'from': {'id': 'deal'}, 'to': [{'toObjectId': str(i)} for i in range(len(emails))]}]},
+            {'status': 'COMPLETE', 'results': [{'id': str(i), 'properties': email} for i, email in enumerate(emails)]},
+        ]
+        with patch.object(r, 'hub', side_effect=responses):
+            return r.qualifying_deals(rows)
+
+    def test_internal_primary_or_secondary_excludes_entire_deal(self):
+        for email in [{'email': 'TEST@TRYTRUEWIND.COM '},
+                      {'email': 'prospect@example.com', 'hs_additional_emails': 'other@example.com;test@trytruewind.com'}]:
+            self.assertEqual(self.qualify([{'email': 'real@example.com'}, email]), [])
+
+    def test_internal_meeting_is_excluded(self):
+        self.assertEqual(self.qualify([{'email': 'test@trytruewind.com'}],
+                         {'calendly_invitee_uri': 'booking', 'truewind_demo_request_contact_id': '1'}), [])
+
+    def test_external_confirmed_booking_and_missing_source_are_preserved(self):
+        rows = self.qualify([{'email': 'prospect@example.com'}],
+                            {'calendly_invitee_uri': 'booking', 'truewind_demo_request_contact_id': '1'})
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]['properties'].get('deal_source'))
+
+    def test_historical_form_only_deals_are_excluded_without_deleting_them(self):
+        self.assertEqual(self.qualify([{'email': 'prospect@example.com'}],
+                         {'truewind_demo_request_contact_id': '1'}), [])
+
+    def test_similar_domains_do_not_exclude_real_prospects(self):
+        self.assertEqual(len(self.qualify([{'email': 'test@trytruewind.com.example.org'}])), 1)
+
+    def test_missing_or_partial_evidence_stops_report(self):
+        for response in [{'status': 'COMPLETE', 'results': []},
+                         {'status': 'PENDING', 'results': []},
+                         {'status': 'COMPLETE', 'results': [], 'errors': ['permission denied']},
+                         {'status': 'COMPLETE', 'results': [{'from': {'id': 'deal'}, 'to': [], 'paging': {'next': {'after': '1'}}}]}]:
+            with self.subTest(response=response), patch.object(r, 'hub', return_value=response):
+                with self.assertRaises(RuntimeError):
+                    r.qualifying_deals([{'id': 'deal', 'properties': {}}])
 
 
 if __name__ == '__main__':
