@@ -83,7 +83,7 @@ def deals_between(start, end):
     rows = {}
     after = None
     for _ in range(50):
-        body = {'filterGroups': [{'filters': filters}], 'properties': ['dealname', 'createdate', 'deal_source', 'hubspot_owner_id'],
+        body = {'filterGroups': [{'filters': filters}], 'properties': ['dealname', 'createdate', 'deal_source', 'hubspot_owner_id', 'truewind_demo_request_contact_id', 'calendly_invitee_uri'],
                 'sorts': ['createdate'], 'limit': 200}
         if after is not None:
             body['after'] = after
@@ -102,6 +102,48 @@ def deals_between(start, end):
 def batches(items, size=100):
     for index in range(0, len(items), size):
         yield items[index:index + size]
+
+
+def qualifying_deals(deals):
+    """Exclude deals linked to any internal email; fail on incomplete evidence."""
+    associations = {}
+    for batch in batches([str(row['id']) for row in deals]):
+        result = hub('/crm/v4/associations/deals/contacts/batch/read',
+                     {'inputs': [{'id': value} for value in batch]})
+        if result.get('errors') or result.get('status') != 'COMPLETE':
+            raise RuntimeError('Incomplete contact association lookup')
+        for row in result['results']:
+            if row.get('paging', {}).get('next'):
+                raise RuntimeError('Contact association pagination requires investigation')
+            associations[str(row['from']['id'])] = {str(item['toObjectId']) for item in row['to']}
+        if not set(batch).issubset(associations):
+            raise RuntimeError('Missing deal contact association results')
+    contacts = {}
+    ids = sorted({value for values in associations.values() for value in values})
+    for batch in batches(ids):
+        result = hub('/crm/v3/objects/contacts/batch/read', {
+            'properties': ['email', 'hs_additional_emails'],
+            'inputs': [{'id': value} for value in batch]})
+        if result.get('errors') or result.get('status') != 'COMPLETE':
+            raise RuntimeError('Incomplete contact email lookup')
+        for row in result['results']:
+            props = row['properties']
+            emails = [props.get('email') or '', *(props.get('hs_additional_emails') or '').split(';')]
+            contacts[str(row['id'])] = any(email.strip().lower().endswith('@trytruewind.com') for email in emails)
+        if not set(batch).issubset(contacts):
+            raise RuntimeError('Missing contact email results')
+    included = []
+    for row in deals:
+        internal = any(contacts[value] for value in associations[str(row['id'])])
+        form_only = bool(row['properties'].get('truewind_demo_request_contact_id')) and not row['properties'].get('calendly_invitee_uri')
+        reason = 'internal_contact' if internal else 'demo_request_without_confirmed_booking' if form_only else 'qualifying_deal'
+        print(json.dumps({'event': 'deal_report_decision', 'deal_id': row['id'],
+                          'included': not (internal or form_only),
+                          'reason': reason,
+                          'source_status': 'set' if row['properties'].get('deal_source') else 'missing_requires_review'}), file=sys.stderr)
+        if not (internal or form_only):
+            included.append(row)
+    return included
 
 
 def company_names(deals):
@@ -156,15 +198,15 @@ def owner_names(deals):
 
 def render(now, weekly=False):
     start, end = window(now, weekly)
-    deals = deals_between(start, end)
+    deals = qualifying_deals(deals_between(start, end))
     as_of = end.strftime('%b %d, %Y at %I:%M %p %Z')
     labels = {option['value']: option['label'] for option in hub('/crm/v3/properties/deals/deal_source')['options']} if deals else {}
     if weekly:
-        header = f'*Week To Date*\n*Deals created this week so far: {len(deals)}*\nMonday {start:%b %d} through {as_of}.\nAll stages and pipelines; HubSpot deal creation date.\n*Deal sources this week:*'
+        header = f'*Week To Date*\n*Deals created this week so far: {len(deals)}*\nMonday {start:%b %d} through {as_of}.\nAll stages and pipelines; HubSpot deal creation date; internal contacts excluded.\n*Deal sources this week:*'
         sources = Counter()
         for row in deals:
             raw = row['properties'].get('deal_source')
-            source = labels.get(raw, raw) if raw else 'Source not set'
+            source = labels.get(raw, raw) if raw else 'Source missing — attribution needs review'
             sources[source] += 1
         lines = [f'• {escape(source)}: {count}' for source, count in sorted(sources.items(), key=lambda item: (-item[1], item[0]))]
         if not lines:
@@ -181,7 +223,7 @@ def render(now, weekly=False):
         created = datetime.fromisoformat(props['createdate'].replace('Z', '+00:00')).astimezone(PT)
         name = companies.get(row['id']) or ('Company not set — ' + (props.get('dealname') or 'Unnamed deal'))
         raw = props.get('deal_source')
-        source = labels.get(raw, raw) if raw else 'Source not set'
+        source = labels.get(raw, raw) if raw else 'Source missing — attribution needs review'
         owner_id = props.get('hubspot_owner_id')
         owner = owners.get(str(owner_id), f'Owner unavailable (ID {owner_id})') if owner_id else 'Unassigned'
         lines.append(f'• <https://app.hubspot.com/contacts/{PORTAL}/record/0-3/{row["id"]}/|{escape(name)}> | {created:%m/%d/%Y %I:%M %p %Z} | {escape(source)} | Owner: {escape(owner)}')
