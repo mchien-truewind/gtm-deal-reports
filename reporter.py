@@ -4,6 +4,7 @@ from collections import Counter
 import html
 import json
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -83,7 +84,7 @@ def deals_between(start, end):
     rows = {}
     after = None
     for _ in range(50):
-        body = {'filterGroups': [{'filters': filters}], 'properties': ['dealname', 'createdate', 'deal_source', 'hubspot_owner_id', 'truewind_demo_request_contact_id', 'calendly_invitee_uri'],
+        body = {'filterGroups': [{'filters': filters}], 'properties': ['dealname', 'createdate', 'deal_source', 'hubspot_owner_id', 'truewind_demo_request_contact_id', 'calendly_invitee_uri', 'description'],
                 'sorts': ['createdate'], 'limit': 200}
         if after is not None:
             body['after'] = after
@@ -196,11 +197,124 @@ def owner_names(deals):
     return names
 
 
+SDR_DEAL_SOURCES = {'outbound - sales sourced list', 'outbound - sdr'}
+BOOKING_DISPOSITION = '887a2c18-be90-404f-8984-5611ca3655a6'
+NOOKS_DEAL_CALL = re.compile(r'Created from a Nooks booked meeting\. Nooks ([\w-]+)/([\w-]+)')
+CALL_PROPERTIES = ['hs_call_disposition', 'hs_call_title', 'hs_timestamp', 'hubspot_owner_id']
+
+
+def associated_ids(object_type, object_id, target):
+    path = f'/crm/v4/objects/{object_type}/{object_id}/associations/{target}'
+    ids = set()
+    after = None
+    for _ in range(50):
+        query = {'limit': 500}
+        if after is not None:
+            query['after'] = after
+        result = hub(path + '?' + urllib.parse.urlencode(query))
+        ids.update(str(row['toObjectId']) for row in result['results'])
+        after = result.get('paging', {}).get('next', {}).get('after')
+        if after is None:
+            return ids
+    raise RuntimeError('SDR association pagination limit exceeded')
+
+
+def booking_call_owners(deal, contacts, contact_calls, calls, end):
+    props = deal['properties']
+    created = datetime.fromisoformat(props['createdate'].replace('Z', '+00:00'))
+    booking = NOOKS_DEAL_CALL.search(props.get('description') or '')
+    if booking:
+        workspace, call_id = booking.groups()
+        result = hub('/crm/v3/objects/calls/search', {
+            'filterGroups': [{'filters': [
+                {'propertyName': 'hs_call_external_id', 'operator': 'EQ', 'value': call_id},
+                {'propertyName': 'hs_call_external_account_id', 'operator': 'EQ', 'value': workspace},
+            ]}],
+            'properties': CALL_PROPERTIES,
+            'limit': 2,
+        })
+        if len(result['results']) == 1:
+            owner = result['results'][0]['properties'].get('hubspot_owner_id')
+            return ({str(owner)}, True) if owner else (set(), True)
+
+    call_ids = set().union(*(contact_calls[contact] for contact in contacts))
+    owners = set()
+    for call_id in call_ids:
+        call = calls[call_id]
+        is_booking = (
+            call.get('hs_call_disposition') == BOOKING_DISPOSITION
+            or (call.get('hs_call_title') or '').lower().startswith('[nooks call] - meeting booked - ')
+        )
+        if is_booking and call.get('hs_timestamp'):
+            timestamp = datetime.fromisoformat(call['hs_timestamp'].replace('Z', '+00:00'))
+            if timestamp <= end and abs(timestamp - created) <= timedelta(hours=3):
+                owners.add(str(call.get('hubspot_owner_id') or ''))
+    return owners, bool(call_ids or booking)
+
+
+def sdr_attribution(deals, labels, end):
+    outbound = []
+    for deal in deals:
+        source = deal['properties'].get('deal_source')
+        if labels.get(source, source or '').strip().lower() in SDR_DEAL_SOURCES:
+            outbound.append(deal)
+    if not outbound:
+        return {}
+
+    try:
+        deal_contacts = {
+            deal['id']: associated_ids('deals', deal['id'], 'contacts') for deal in outbound
+        }
+        contact_calls = {
+            contact: associated_ids('contacts', contact, 'calls')
+            for contact in sorted(set().union(*deal_contacts.values()))
+        }
+        calls = {}
+        for batch in batches(sorted(set().union(*contact_calls.values()))):
+            result = hub('/crm/v3/objects/calls/batch/read', {
+                'properties': CALL_PROPERTIES,
+                'inputs': [{'id': call_id} for call_id in batch],
+            })
+            if result.get('errors') or result.get('status') != 'COMPLETE':
+                raise RuntimeError('Incomplete SDR call lookup')
+            calls.update((str(row['id']), row['properties']) for row in result['results'])
+            if not set(batch).issubset(calls):
+                raise RuntimeError('Missing SDR call results')
+
+        evidence = {
+            deal['id']: booking_call_owners(deal, deal_contacts[deal['id']], contact_calls, calls, end)
+            for deal in outbound
+        }
+        owner_ids = set().union(*(ids for ids, _ in evidence.values())) - {''}
+        names = owner_names([{'properties': {'hubspot_owner_id': owner}} for owner in owner_ids])
+    except (RuntimeError, OSError, ValueError, KeyError) as error:
+        print(json.dumps({'event': 'sdr_attribution_lookup_failed', 'error_type': type(error).__name__}),
+              file=sys.stderr)
+        return {deal['id']: 'Unverified—lookup unavailable' for deal in outbound}
+
+    attribution = {}
+    for deal_id, (ids, has_activity) in evidence.items():
+        if len(ids) > 1:
+            attribution[deal_id] = 'Unverified—multiple booking callers'
+        elif ids:
+            attribution[deal_id] = names.get(next(iter(ids)), 'Unverified—booking caller unavailable')
+        elif has_activity:
+            attribution[deal_id] = 'Unverified—no booking call found'
+        else:
+            attribution[deal_id] = 'no call activity'
+    return attribution
+
+
+def deal_link(deal_id, name):
+    return f'• <https://app.hubspot.com/contacts/{PORTAL}/record/0-3/{deal_id}/|{escape(name)}>'
+
+
 def render(now, weekly=False):
     start, end = window(now, weekly)
     deals = qualifying_deals(deals_between(start, end))
     as_of = end.strftime('%b %d, %Y at %I:%M %p %Z')
     labels = {option['value']: option['label'] for option in hub('/crm/v3/properties/deals/deal_source')['options']} if deals else {}
+    attribution = sdr_attribution(deals, labels, end)
     if weekly:
         header = f'*Week To Date*\n*Deals created this week so far: {len(deals)}*\nMonday {start:%b %d} through {as_of}.\nAll stages and pipelines; HubSpot deal creation date; internal contacts excluded.\n*Deal sources this week:*'
         sources = Counter()
@@ -211,9 +325,17 @@ def render(now, weekly=False):
         lines = [f'• {escape(source)}: {count}' for source, count in sorted(sources.items(), key=lambda item: (-item[1], item[0]))]
         if not lines:
             lines = ['No deals created this week so far.']
+        if attribution:
+            lines.append('*SDR attribution this week:*')
+            for row in deals:
+                if row['id'] in attribution:
+                    props = row['properties']
+                    name = props.get('dealname') or 'Unnamed deal'
+                    lines.append(deal_link(row['id'], name) + f' | SDR: {escape(attribution[row["id"]])}')
         return split_messages(header, lines, '*Week To Date*\n*Deal sources this week — continued*')
     companies = company_names(deals)
-    owners = owner_names(deals)
+    show_owners = end.hour != 12
+    owners = owner_names(deals) if show_owners else {}
     period = 'am' if end.hour < 12 else 'pm'
     title = f'Daily {end.hour % 12 or 12}{period} Report:'
     header = f'*{title}*\n*Deals created today: {len(deals)}*\nSince midnight Pacific • As of {as_of}'
@@ -224,9 +346,14 @@ def render(now, weekly=False):
         name = companies.get(row['id']) or ('Company not set — ' + (props.get('dealname') or 'Unnamed deal'))
         raw = props.get('deal_source')
         source = labels.get(raw, raw) if raw else 'Source missing — attribution needs review'
-        owner_id = props.get('hubspot_owner_id')
-        owner = owners.get(str(owner_id), f'Owner unavailable (ID {owner_id})') if owner_id else 'Unassigned'
-        lines.append(f'• <https://app.hubspot.com/contacts/{PORTAL}/record/0-3/{row["id"]}/|{escape(name)}> | {created:%m/%d/%Y %I:%M %p %Z} | {escape(source)} | Owner: {escape(owner)}')
+        line = deal_link(row['id'], name) + f' | {created:%m/%d/%Y %I:%M %p %Z} | {escape(source)}'
+        if show_owners:
+            owner_id = props.get('hubspot_owner_id')
+            owner = owners.get(str(owner_id), f'Owner unavailable (ID {owner_id})') if owner_id else 'Unassigned'
+            line += f' | Owner: {escape(owner)}'
+        if row['id'] in attribution:
+            line += f' | SDR: {escape(attribution[row["id"]])}'
+        lines.append(line)
     if not lines:
         lines = ['No deals created today so far.']
         if end.hour == 18:
