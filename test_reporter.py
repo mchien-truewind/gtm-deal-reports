@@ -119,6 +119,65 @@ class ReporterTests(unittest.TestCase):
             text = r.render(datetime.fromisoformat('2026-10-26T22:00:00-07:00'))[0]
             self.assertIn('Owner: Alex Smith', text)
 
+    def test_sdr_attribution_appears_in_daily_and_weekly_reports(self):
+        now = datetime.fromisoformat('2026-11-13T12:01:00-08:00')
+        deal = {'id': '1', 'properties': {
+            'createdate': '2026-11-13T17:20:00Z', 'deal_source': 'sales',
+            'hubspot_owner_id': 'ae', 'dealname': 'Example',
+        }}
+        call = {'id': '3', 'properties': {
+            'hs_timestamp': '2026-11-13T17:25:00Z',
+            'hs_call_disposition': r.BOOKING_DISPOSITION,
+            'hubspot_owner_id': 'sdr',
+        }}
+
+        def hub(path, payload=None):
+            if path.endswith('deal_source'):
+                return {'options': [{'value': 'sales', 'label': 'Outbound - SDR'}]}
+            if '/associations/contacts?' in path:
+                return {'results': [{'toObjectId': 2}]}
+            if '/associations/calls?' in path:
+                return {'results': [{'toObjectId': 3}]}
+            if path.endswith('/calls/batch/read'):
+                return {'status': 'COMPLETE', 'results': [call]}
+            self.fail(f'Unexpected HubSpot endpoint: {path}')
+
+        with patch.object(r, 'deals_between', return_value=[deal]), patch.object(
+            r, 'company_names', return_value={'1': 'Example'}
+        ), patch.object(r, 'hub', side_effect=hub), patch.object(
+            r, 'owner_names', return_value={'sdr': 'Ocean Marquez', 'ae': 'Xavier Marco'}
+        ):
+            noon = r.render(now)[0]
+            evening = r.render(now.replace(hour=18))[0]
+            weekly = r.render(now.replace(hour=21), weekly=True)[0]
+
+        for message in (noon, evening, weekly):
+            self.assertIn('SDR: Ocean Marquez', message)
+        self.assertNotIn('Owner:', noon)
+        self.assertIn('Owner: Xavier Marco | SDR: Ocean Marquez', evening)
+        self.assertIn('Outbound - SDR: 1', weekly)
+
+    def test_direct_booking_call_can_resolve_without_contact_call_activity(self):
+        deal = {'properties': {
+            'createdate': '2026-11-13T17:20:00Z',
+            'description': 'Created from a Nooks booked meeting. Nooks workspace/call-id',
+        }}
+        response = {'results': [{'properties': {'hubspot_owner_id': 'sdr'}}]}
+        with patch.object(r, 'hub', return_value=response) as lookup:
+            owners, has_activity = r.booking_call_owners(
+                deal, set(), {}, {}, datetime.fromisoformat('2026-11-13T20:01:00+00:00')
+            )
+        self.assertEqual(owners, {'sdr'})
+        self.assertTrue(has_activity)
+        filters = lookup.call_args.args[1]['filterGroups'][0]['filters']
+        self.assertEqual({item['value'] for item in filters}, {'workspace', 'call-id'})
+
+    def test_failed_sdr_lookup_is_not_reported_as_no_call_activity(self):
+        deal = {'id': '1', 'properties': {'deal_source': 'Outbound - SDR'}}
+        with patch.object(r, 'hub', side_effect=RuntimeError('permission denied')):
+            result = r.sdr_attribution([deal], {}, datetime.now(r.PT))
+        self.assertEqual(result, {'1': 'Unverified—lookup unavailable'})
+
     def test_partial_slack_failure_does_not_repeat_successful_parts(self):
         db = sqlite3.connect(':memory:')
         db.execute('CREATE TABLE deliveries (id TEXT PRIMARY KEY, state TEXT NOT NULL)')
