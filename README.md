@@ -15,7 +15,13 @@ Only Monday–Friday at 12:00, 18:00 and 21:00 local time are eligible.
 This handles daylight saving changes without editing cron. Railway may start a
 run a few minutes after the hour. At 21:00 the report counts deals created since
 Monday 00:00 Pacific and includes counts grouped by deal source (including
-missing sources); otherwise it lists deals created since local midnight.
+missing sources) and lists SDR attribution for sales-sourced outbound deals.
+The daily reports list deals created since local midnight and include SDR
+attribution on sales-sourced outbound rows. Attribution uses a Nooks call ID
+recorded on the deal when available. Otherwise it checks associated contacts
+for booking calls within three hours of deal creation. Inconclusive matches
+and unavailable call lookups are labeled in Slack. The HubSpot token also
+needs access to deal/contact and contact/call associations, calls, and owners.
 All active HubSpot deal records, stages and pipelines are included.
 Only the 18:00 Pacific daily report with zero deals mentions Dillon, Xavier,
 Sarah, Nicole, Liz, and Alex and asks: “what are your priorities tomorrow to
@@ -24,7 +30,7 @@ come from the User ID Lookups Google Sheet (`Sheet1!A2:B7`, verified October 27,
 2026). The 21:00 week-to-date summary does not include this prompt.
 Distinct deal IDs are counted separately even if company/deal names match. Archived/deleted
 records are excluded by HubSpot search. Creation timestamps use `createdate`;
-sources use the current display labels of `deal_source`. Each daily deal line
+sources use the current display labels of `deal_source`. Each 18:00 daily deal line
 includes its current deal owner, resolved from `hubspot_owner_id` through the
 HubSpot owners directory (including archived owners). Unassigned deals and
 unavailable owner names are explicitly marked. The token must also allow owner reads.
